@@ -174,6 +174,146 @@ def sensitive_cells(values: Sequence[Sequence[int]]) -> set[Cell]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Subtotal reissue analysis
+#
+# A reissued subtotal discloses the sum of one industry column over a group of
+# districts.  The public then knows: the bulletin totals, the visible cells,
+# every subtotal published so far for the quarter, and the new one.  Every
+# originally-masked cell must still have at least two feasible values.
+#
+# The district groups of one industry form a laminar family (enforced at
+# reissue time), so each column's group sums decompose into disjoint "atom"
+# sums: an atom is a group minus its direct children, and its sum follows by
+# inclusion-exclusion.  The feasible set is therefore a flow polytope - row
+# and column residuals from the bulletin plus one exact-capacity edge per
+# atom - and each cell's exact integer range comes from two max-flow runs on
+# the residual network, exactly as in ``cell_bounds``.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ReissueCheck:
+    """Outcome of testing a candidate subtotal against the protection rule."""
+
+    ok: bool
+    pinned: list[Cell]
+    bounds: dict[Cell, tuple[int, int]]
+
+
+def _column_atoms(sets_res: dict[frozenset, int]) -> list[tuple[frozenset, int]]:
+    """Split one column's laminar group sums into disjoint atom sums.
+
+    ``sets_res`` maps a district group (already restricted to the column's
+    masked rows) to the residual sum its subtotal puts on it.  Because the
+    family is laminar, every group is the disjoint union of its direct
+    children and the rows in no child; those leftovers are the atoms and each
+    atom's sum is fixed by inclusion-exclusion.  Empty atoms carry no cells
+    (their zero residual is a consistency condition) and are dropped.
+    """
+    ordered = sorted(sets_res.items(), key=lambda kv: (len(kv[0]), sorted(kv[0])))
+    atoms: list[tuple[frozenset, int]] = []
+    for group, residual in ordered:
+        children = [
+            other for other, _ in ordered
+            if other < group
+            and not any(other < mid < group for mid, _ in ordered)
+        ]
+        rows = set(group)
+        total = residual
+        for child in children:
+            rows -= child
+            total -= sets_res[child]
+        if rows:
+            atoms.append((frozenset(rows), total))
+    return atoms
+
+
+def _subtotal_residual(n_nodes: int, masked: set[Cell],
+                       values: Sequence[Sequence[int]],
+                       arc_target, skip: Cell) -> _Dinic:
+    """Residual network for the subtotal flow polytope.
+
+    Only the masked-cell arcs carry residual capacity: the exact edges (row
+    residuals, atom sums, column residuals) are saturated in both directions
+    and drop out, so a circulation is precisely a reallocation among masked
+    cells that keeps every published number fixed.
+    """
+    flow = _Dinic(n_nodes)
+    for i, j in masked:
+        if (i, j) == skip:
+            continue
+        target = arc_target(i, j)
+        flow.add(i, target, INF)
+        if values[i][j] > 0:
+            flow.add(target, i, values[i][j])
+    return flow
+
+
+def reissue_bounds(values: Sequence[Sequence[int]], masked: Iterable[Cell],
+                   constraints: Iterable[tuple[int, frozenset, int]],
+                   row_totals: Sequence[int],
+                   col_totals: Sequence[int]) -> dict[Cell, tuple[int, int]]:
+    """Exact integer range of every masked cell given published subtotals.
+
+    ``values`` is the detail as published (a feasible point, used as the
+    reference flow); ``masked`` are the cells the bulletin hides;
+    ``constraints`` are ``(column, district_rows, subtotal)`` triples covering
+    every subtotal already public for the quarter plus the candidate one.
+    """
+    masked_set = set(masked)
+    n_rows, n_cols = len(values), len(values[0])
+
+    per_col: list[dict[frozenset, int]] = [dict() for _ in range(n_cols)]
+    for j, rows, subtotal in constraints:
+        residual = subtotal - sum(
+            values[i][j] for i in rows if (i, j) not in masked_set
+        )
+        covered = frozenset(i for i in rows if (i, j) in masked_set)
+        if covered:
+            # Two different groups can restrict to the same masked rows; the
+            # residuals then coincide because the published detail satisfies
+            # both constraints.
+            per_col[j][covered] = residual
+
+    # Node ids: rows 0..n_rows-1, columns n_rows..n_rows+n_cols-1, then one
+    # node per atom.  A masked cell arcs from its row to its atom (or straight
+    # to its column when no group covers it).
+    target: dict[Cell, int] = {}
+    n_nodes = n_rows + n_cols
+    for j in range(n_cols):
+        for atom_rows, _atom_sum in _column_atoms(per_col[j]):
+            for i in atom_rows:
+                target[(i, j)] = n_nodes
+            n_nodes += 1
+
+    def arc_target(i: int, j: int) -> int:
+        return target.get((i, j), n_rows + j)
+
+    bounds: dict[Cell, tuple[int, int]] = {}
+    for cell in sorted(masked_set):
+        i, j = cell
+        head = arc_target(i, j)
+        value = values[i][j]
+        up = _subtotal_residual(
+            n_nodes, masked_set, values, arc_target, cell).maxflow(head, i)
+        down = _subtotal_residual(
+            n_nodes, masked_set, values, arc_target, cell).maxflow(i, head)
+        bounds[cell] = (value - min(value, down), value + up)
+    return bounds
+
+
+def reissue_check(values: Sequence[Sequence[int]], masked: Iterable[Cell],
+                  constraints: Iterable[tuple[int, frozenset, int]],
+                  row_totals: Sequence[int],
+                  col_totals: Sequence[int]) -> ReissueCheck:
+    """Verify every masked cell keeps at least two feasible values."""
+    bounds = reissue_bounds(values, masked, constraints, row_totals,
+                            col_totals)
+    pinned = [cell for cell, (lo, hi) in sorted(bounds.items()) if lo == hi]
+    return ReissueCheck(ok=not pinned, pinned=pinned, bounds=bounds)
+
+
 def analyze(values: Sequence[Sequence[int]], masked: Iterable[Cell],
             must_public: Iterable[Cell]) -> Analysis:
     """Full validity check of a suppression pattern."""

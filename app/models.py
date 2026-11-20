@@ -90,5 +90,30 @@ class PublishRequest(StrictModel):
     mask_version: StrictInt | None = Field(default=None, ge=1)
 
 
+class SubtotalRequest(StrictModel):
+    """A district-group subtotal reissue for one industry of a quarter."""
+
+    industry: str = Field(min_length=1, max_length=64)
+    districts: list[str] = Field(min_length=2, max_length=MAX_DIMENSION)
+
+    @field_validator("industry")
+    @classmethod
+    def industry_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("industry must not be blank")
+        return value
+
+    @field_validator("districts")
+    @classmethod
+    def districts_unique(cls, names: list[str]) -> list[str]:
+        cleaned = [name.strip() for name in names]
+        if any(not name for name in cleaned):
+            raise ValueError("district names must not be blank")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("districts must be unique within the group")
+        return cleaned
+
+
 class TokenRequest(StrictModel):
     label: str = Field(min_length=1, max_length=64)

@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+import threading
 from datetime import datetime, timezone
 from typing import Any, Iterable, Sequence
 
@@ -34,6 +35,7 @@ from .models import (
     DetailSubmission,
     MaskSubmission,
     PublishRequest,
+    SubtotalRequest,
     TotalsRegistration,
 )
 
@@ -110,6 +112,11 @@ def totals_mismatch(issues: list[dict]) -> ApiError:
 class BulletinService:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+        # One lock per quarter serialises subtotal reissues of that quarter
+        # (the confidentiality check must observe every subtotal published
+        # before it), while reissues of other quarters proceed in parallel.
+        self._quarter_locks: dict[str, threading.Lock] = {}
+        self._quarter_locks_guard = threading.Lock()
 
     # ------------------------------------------------------------------ setup
 
@@ -634,6 +641,207 @@ class BulletinService:
             "cells": visible,
             "published_at": now(),
         }
+
+    # -------------------------------------------------------------- subtotals
+
+    def _quarter_lock(self, quarter: str) -> threading.Lock:
+        with self._quarter_locks_guard:
+            lock = self._quarter_locks.get(quarter)
+            if lock is None:
+                lock = self._quarter_locks[quarter] = threading.Lock()
+            return lock
+
+    def reissue_subtotal(self, quarter: str, body: SubtotalRequest,
+                         token_id: int | None) -> dict[str, Any]:
+        """Publish a district-group subtotal for one industry of a quarter.
+
+        The subtotal is computed from the detail version the bulletin was
+        published with, and is released only if every originally-masked cell
+        still has at least two feasible values given everything the public
+        can see afterwards.  Reissues of one quarter are serialised so the
+        check always covers every subtotal published before this one; the
+        check itself runs outside any database transaction, so other
+        quarters complete concurrently.
+        """
+        from .db import connect
+
+        with self._quarter_lock(quarter):
+            conn = connect(self.db_path)
+            try:
+                q = self._quarter_row(conn, quarter)
+                bulletin = self._bulletin_row(conn, quarter)
+                if bulletin is None:
+                    raise not_found("bulletin", quarter)
+                district_labels = json.loads(q["district_labels"])
+                industry_labels = json.loads(q["industry_labels"])
+
+                if body.industry not in industry_labels:
+                    raise ApiError(
+                        422, "unknown_industry",
+                        f"{body.industry!r} is not an industry of {quarter}",
+                        {"industry": body.industry,
+                         "known": industry_labels},
+                    )
+                industry_idx = industry_labels.index(body.industry)
+                unknown = [name for name in dict.fromkeys(body.districts)
+                           if name not in district_labels]
+                if unknown:
+                    raise ApiError(
+                        422, "unknown_districts",
+                        "some districts are not part of " + quarter,
+                        {"districts": unknown, "known": district_labels},
+                    )
+                rows = sorted({district_labels.index(name)
+                               for name in body.districts})
+                district_key = json.dumps(rows)
+
+                existing = conn.execute(
+                    "SELECT * FROM subtotals WHERE quarter=? AND "
+                    "industry_idx=? AND district_idx=?",
+                    (quarter, industry_idx, district_key),
+                ).fetchone()
+                if existing is not None:
+                    # Idempotent replay of the same group.
+                    return self._subtotal_response(existing, created=False)
+
+                siblings = conn.execute(
+                    "SELECT * FROM subtotals WHERE quarter=? AND "
+                    "industry_idx=? ORDER BY id",
+                    (quarter, industry_idx),
+                ).fetchall()
+                new_set = set(rows)
+                overlapping = [
+                    s for s in siblings
+                    if (lambda old: new_set & old
+                        and not (new_set <= old or old <= new_set))(
+                        set(json.loads(s["district_idx"])))
+                ]
+                if overlapping:
+                    raise conflict(
+                        "district_groups_overlap",
+                        "district groups of one quarter and industry must be "
+                        "disjoint or nested; the submitted group partially "
+                        "overlaps an already published group",
+                        {
+                            "submitted": [district_labels[i] for i in rows],
+                            "conflicts": [
+                                {"industry": s["industry"],
+                                 "districts": json.loads(s["districts"]),
+                                 "subtotal": s["subtotal"]}
+                                for s in overlapping
+                            ],
+                        },
+                    )
+
+                detail = self._detail_row(conn, quarter,
+                                          bulletin["detail_version"])
+                values = json.loads(detail["values_json"])
+                subtotal = sum(values[i][industry_idx] for i in rows)
+
+                payload = json.loads(bulletin["payload_json"])
+                masked = {
+                    (i, j)
+                    for i, row in enumerate(payload["cells"])
+                    for j, value in enumerate(row)
+                    if value is None
+                }
+                published = conn.execute(
+                    "SELECT * FROM subtotals WHERE quarter=?", (quarter,),
+                ).fetchall()
+                constraints = [
+                    (s["industry_idx"],
+                     frozenset(json.loads(s["district_idx"])),
+                     s["subtotal"])
+                    for s in published
+                ]
+                constraints.append((industry_idx, frozenset(rows), subtotal))
+                check = suppression.reissue_check(
+                    values, masked, constraints,
+                    payload["row_totals"], payload["col_totals"])
+                if not check.ok:
+                    raise conflict(
+                        "subtotal_breaks_protection",
+                        f"with this subtotal public, {len(check.pinned)} "
+                        "originally-masked cell(s) would be pinned to a "
+                        "single feasible value; the reissue is rejected",
+                        {
+                            "cells": [
+                                {"row": r, "col": c,
+                                 "district": district_labels[r],
+                                 "industry": industry_labels[c]}
+                                for r, c in check.pinned
+                            ],
+                            "hint": "choose a different or larger district "
+                                    "group; the bulletin and all published "
+                                    "subtotals remain unchanged",
+                        },
+                    )
+
+                published_at = now()
+                districts_json = json.dumps([district_labels[i] for i in rows])
+                try:
+                    with transaction(conn):
+                        conn.execute(
+                            "INSERT INTO subtotals(quarter, industry, "
+                            "industry_idx, districts, district_idx, subtotal, "
+                            "published_at, published_by) "
+                            "VALUES(?,?,?,?,?,?,?,?)",
+                            (quarter, body.industry, industry_idx,
+                             districts_json, district_key, subtotal,
+                             published_at, token_id),
+                        )
+                except Exception as exc:  # UNIQUE(quarter, industry, group)
+                    if "UNIQUE" in str(exc).upper():
+                        raced = conn.execute(
+                            "SELECT * FROM subtotals WHERE quarter=? AND "
+                            "industry_idx=? AND district_idx=?",
+                            (quarter, industry_idx, district_key),
+                        ).fetchone()
+                        return self._subtotal_response(raced, created=False)
+                    raise
+                stored = conn.execute(
+                    "SELECT * FROM subtotals WHERE quarter=? AND "
+                    "industry_idx=? AND district_idx=?",
+                    (quarter, industry_idx, district_key),
+                ).fetchone()
+                return self._subtotal_response(stored, created=True)
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _subtotal_response(row, created: bool) -> dict[str, Any]:
+        return {
+            "quarter": row["quarter"],
+            "industry": row["industry"],
+            "districts": json.loads(row["districts"]),
+            "subtotal": row["subtotal"],
+            "published_at": row["published_at"],
+            "created": created,
+        }
+
+    def list_subtotals(self, quarter: str) -> dict[str, Any]:
+        from .db import connect
+
+        conn = connect(self.db_path)
+        try:
+            if self._bulletin_row(conn, quarter) is None:
+                raise not_found("bulletin", quarter)
+            rows = conn.execute(
+                "SELECT * FROM subtotals WHERE quarter=? ORDER BY id",
+                (quarter,),
+            ).fetchall()
+            return {
+                "quarter": quarter,
+                "subtotals": [
+                    {"industry": row["industry"],
+                     "districts": json.loads(row["districts"]),
+                     "subtotal": row["subtotal"],
+                     "published_at": row["published_at"]}
+                    for row in rows
+                ],
+            }
+        finally:
+            conn.close()
 
     # ----------------------------------------------------------------- reads
 

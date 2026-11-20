@@ -14,6 +14,7 @@ from .models import (
     DetailSubmission,
     MaskSubmission,
     PublishRequest,
+    SubtotalRequest,
     SuggestionRequest,
     TokenRequest,
     TotalsRegistration,
@@ -99,6 +100,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
     def get_bulletin(quarter: Quarter) -> dict[str, Any]:
         return service.get_public(quarter)
 
+    @app.get("/api/v1/bulletins/{quarter}/subtotals")
+    def list_subtotals(quarter: Quarter) -> dict[str, Any]:
+        return service.list_subtotals(quarter)
+
     # ----------------------------------------------------------------- editor
 
     @app.post("/api/v1/editor/tokens")
@@ -137,6 +142,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 body: PublishRequest = Body(default_factory=PublishRequest)
                 ) -> dict[str, Any]:
         return service.publish(quarter, body, editor)
+
+    @app.post("/api/v1/editor/quarters/{quarter}/subtotals")
+    def reissue_subtotal(quarter: Quarter, editor: Editor,
+                         body: SubtotalRequest = Body(...)) -> dict[str, Any]:
+        return service.reissue_subtotal(quarter, body, editor)
 
     return app
 

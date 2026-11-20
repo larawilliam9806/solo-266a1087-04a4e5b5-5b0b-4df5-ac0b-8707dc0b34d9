@@ -56,6 +56,19 @@ CREATE TABLE IF NOT EXISTS bulletins(
     published_by     INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS subtotals(
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    quarter       TEXT    NOT NULL REFERENCES quarters(quarter),
+    industry      TEXT    NOT NULL,
+    industry_idx  INTEGER NOT NULL,
+    districts     TEXT    NOT NULL,
+    district_idx  TEXT    NOT NULL,
+    subtotal      INTEGER NOT NULL,
+    published_at  TEXT    NOT NULL,
+    published_by  INTEGER,
+    UNIQUE(quarter, industry_idx, district_idx)
+);
+
 CREATE TABLE IF NOT EXISTS editor_tokens(
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     label       TEXT    NOT NULL,
